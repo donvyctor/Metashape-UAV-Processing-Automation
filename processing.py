@@ -196,10 +196,7 @@ def _find_network_config_file(uav_root: str) -> str:
 
 def read_network_config(uav_root: str):
     """
-    Read networkConfig.txt with keys:
-        host: halo
-        port: 9001
-        root: /datawaha/...
+    
 
     Returns dict { "host": str, "port": int, "root": str } or None if missing/broken.
     """
