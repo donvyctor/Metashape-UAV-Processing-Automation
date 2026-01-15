@@ -1,0 +1,18 @@
+# Metashape projects and outputs
+processing/
+Outputs/
+*.psx
+*.tif
+*.tiff
+*.jpg
+*.jpeg
+*.png
+*.txt
+*.csv
+
+# Python stuff
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
