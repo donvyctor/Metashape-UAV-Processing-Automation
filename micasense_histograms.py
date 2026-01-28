@@ -8,18 +8,15 @@ micasense_histograms.py
     baseline = median altitude of first N samples with altitude
     start flight when alt >= baseline + threshold
     end flight when alt <= (baseline + threshold - hysteresis)
-  -> Detect up to 2 flight segments, Flight 01 and Flight 02.
-- Also compute JOIN histograms using ALL images (both flights together)
-- Output per-camera histograms (blue/red) BUT:
-    NO subfolders for camera, everything inside flight folders.
+- For each (band, camera), compute histograms for:
+    * flight_01
+    * flight_02 (if detected)
+    * join (all images)
+- Plot them on the SAME figure (3 curves) and save ONE PNG per (band, camera).
 
 Outputs:
-UAV/histogram/<Site>/flight_01/band_06_blue.png
-UAV/histogram/<Site>/flight_01/band_06_red.png
-UAV/histogram/<Site>/flight_02/band_06_blue.png
-UAV/histogram/<Site>/flight_02/band_06_red.png
-UAV/histogram/<Site>/join/band_06_blue.png
-UAV/histogram/<Site>/join/band_06_red.png
+UAV/histogram/<Site>/band_06_blue.png
+UAV/histogram/<Site>/band_06_red.png
 
 Logs:
 UAV/histogram/<Site>/flight_summary.txt
@@ -163,9 +160,6 @@ def _ratio_to_float(v) -> Optional[float]:
 
 
 def extract_alt_time_exifread(fp: Path) -> Tuple[Optional[float], Optional[datetime]]:
-    """
-    Read GPS altitude and capture time using exifread from TIFF.
-    """
     try:
         with fp.open("rb") as f:
             tags = exifread.process_file(f, details=False)
@@ -249,22 +243,6 @@ def update_hist(counts: np.ndarray, img: np.ndarray, bins: int, value_range: Tup
     counts += hist.astype(np.int64)
 
 
-def save_hist_plot(out_path: Path, counts: np.ndarray, bins: int, value_range: Tuple[int, int], title: str) -> None:
-    lo, hi = value_range
-    edges = np.linspace(lo, hi, bins + 1, dtype=np.float64)
-    centers = (edges[:-1] + edges[1:]) / 2.0
-
-    plt.figure()
-    plt.plot(centers, counts)
-    plt.title(title)
-    plt.xlabel("Pixel value")
-    plt.yscale("log")
-    plt.ylabel("Count (log scale)")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-
 def parse_bands(spec: str) -> List[int]:
     spec = spec.strip()
     if "," not in spec and "-" in spec:
@@ -284,7 +262,7 @@ def parse_bands(spec: str) -> List[int]:
     return sorted(set(out))
 
 
-def detect_flight_segments_by_altitude(
+def detect_flights_by_altitude(
     recs_sorted: List[ImgRec],
     baseline_first_n: int,
     alt_threshold_m: float,
@@ -320,7 +298,6 @@ def detect_flight_segments_by_altitude(
         alt = r.alt
         if alt is None:
             continue
-
         if not in_flight and alt >= start_thr:
             in_flight = True
             seg_start = i
@@ -341,6 +318,36 @@ def detect_flight_segments_by_altitude(
 
     split_time = recs_sorted[good[1][0]].t
     return 2, baseline, split_time
+
+
+def save_three_hist_plot(
+    out_path: Path,
+    counts_f1: Optional[np.ndarray],
+    counts_f2: Optional[np.ndarray],
+    counts_join: np.ndarray,
+    bins: int,
+    value_range: Tuple[int, int],
+    title: str,
+) -> None:
+    lo, hi = value_range
+    edges = np.linspace(lo, hi, bins + 1, dtype=np.float64)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+
+    plt.figure()
+    if counts_f1 is not None:
+        plt.plot(centers, counts_f1, label="flight_01")
+    if counts_f2 is not None:
+        plt.plot(centers, counts_f2, label="flight_02")
+    plt.plot(centers, counts_join, label="join")
+
+    plt.title(title)
+    plt.xlabel("Pixel value")
+    plt.yscale("log")
+    plt.ylabel("Count (log scale)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
 
 
 def main() -> None:
@@ -373,20 +380,20 @@ def main() -> None:
     bins = int(args.bins)
     stride = max(1, int(args.stride))
 
-    base_out = uav_root / "histogram" / site
-    base_out.mkdir(parents=True, exist_ok=True)
+    out_dir = uav_root / "histogram" / site
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    bad_log = base_out / "bad_tiffs.txt"
+    bad_log = out_dir / "bad_tiffs.txt"
     bad_log.write_text("reason\tpath\textra\n-----\t----\t-----\n")
 
-    summary_txt = base_out / "flight_summary.txt"
+    summary_txt = out_dir / "flight_summary.txt"
 
     print(f"UAV root: {uav_root}")
     print(f"Site: {site}")
     print(f"Bands: {wanted_bands}")
     print(f"Bins: {bins}, Range: {value_range}, Stride: {stride}")
     print(f"Altitude split: baseline_first_n={args.baseline_first_n}, threshold={args.alt_threshold_m}m, hysteresis={args.hysteresis_m}m, min_segment={args.min_segment_len}")
-    print(f"Output: {base_out}")
+    print(f"Output: {out_dir}")
     print()
 
     tifs = find_micasense_tifs(uav_root, site)
@@ -423,7 +430,7 @@ def main() -> None:
     records_sorted = sorted(records, key=lambda r: r.t)
     alt_available = sum(1 for r in records_sorted if r.alt is not None)
 
-    n_flights, baseline_alt, split_time = detect_flight_segments_by_altitude(
+    n_flights, baseline_alt, split_time = detect_flights_by_altitude(
         records_sorted,
         baseline_first_n=int(args.baseline_first_n),
         alt_threshold_m=float(args.alt_threshold_m),
@@ -435,16 +442,6 @@ def main() -> None:
         if n_flights == 1 or split_time is None:
             return 1
         return 1 if r.t < split_time else 2
-
-    # Groups:
-    #   flight_01, flight_02, and join (all images)
-    # Key: (group_name, camera, band) -> list[Path]
-    groups: Dict[Tuple[str, str, int], List[Path]] = {}
-
-    for r in records_sorted:
-        fl = flight_of(r)
-        groups.setdefault((f"flight_{fl:02d}", r.camera, r.band), []).append(r.path)
-        groups.setdefault(("join", r.camera, r.band), []).append(r.path)
 
     # Summary
     lines = []
@@ -463,72 +460,93 @@ def main() -> None:
     lines.append(f"Detected flights: {n_flights}")
     if split_time is not None:
         lines.append(f"Flight 2 starts at: {split_time.isoformat(sep=' ')}")
-
-    for fl in range(1, n_flights + 1):
-        ts = [r.t for r in records_sorted if flight_of(r) == fl]
-        ts.sort()
-        if ts:
-            lines.append(f"Flight {fl:02d}: {ts[0].isoformat(sep=' ')} -> {ts[-1].isoformat(sep=' ')} | files={len(ts)}")
-
     summary_txt.write_text("\n".join(lines) + "\n")
 
     print()
     print("\n".join(lines))
     print()
 
-    # Create output dirs (ONLY flight folders + join)
-    (base_out / "join").mkdir(parents=True, exist_ok=True)
-    for fl in range(1, n_flights + 1):
-        (base_out / f"flight_{fl:02d}").mkdir(parents=True, exist_ok=True)
+    # Collect files per (band, cam) for join + per flight
+    files_join: Dict[Tuple[int, str], List[Path]] = {}
+    files_f1: Dict[Tuple[int, str], List[Path]] = {}
+    files_f2: Dict[Tuple[int, str], List[Path]] = {}
 
-    # Compute histograms:
-    # For each band, you will get:
-    #   flight_01: band_XX_blue.png / band_XX_red.png
-    #   flight_02: ...
-    #   join: ...
-    group_names = ["flight_01"]
-    if n_flights == 2:
-        group_names.append("flight_02")
-    group_names.append("join")
+    for r in records_sorted:
+        key = (r.band, r.camera)
+        files_join.setdefault(key, []).append(r.path)
+        if flight_of(r) == 1:
+            files_f1.setdefault(key, []).append(r.path)
+        else:
+            files_f2.setdefault(key, []).append(r.path)
 
-    for group in group_names:
-        for cam in ("blue", "red"):
-            for band in wanted_bands:
-                files = groups.get((group, cam, band), [])
-                if not files:
+    # Compute + plot for each band/camera
+    for cam in ("blue", "red"):
+        for band in wanted_bands:
+            key = (band, cam)
+            join_list = files_join.get(key, [])
+            if not join_list:
+                continue  # nothing at all for this band/cam
+
+            # Hist arrays
+            counts_join = np.zeros(bins, dtype=np.int64)
+            counts_f1 = np.zeros(bins, dtype=np.int64) if files_f1.get(key) else None
+            counts_f2 = np.zeros(bins, dtype=np.int64) if (n_flights == 2 and files_f2.get(key)) else None
+
+            # JOIN
+            for fp in iter_with_progress(sorted(join_list), desc=f"JOIN {cam} B{band:02d}"):
+                try:
+                    if not looks_like_tiff(fp):
+                        with bad_log.open("a") as f:
+                            f.write(f"NOT_TIFF_OR_EMPTY\t{fp}\t-\n")
+                        continue
+                    img = tiff.imread(str(fp))
+                    update_hist(counts_join, img, bins=bins, value_range=value_range, stride=stride)
+                except (TiffFileError, OSError, ValueError) as e:
+                    with bad_log.open("a") as f:
+                        f.write(f"READ_ERROR\t{fp}\t{repr(e)}\n")
                     continue
 
-                counts = np.zeros(bins, dtype=np.int64)
-                processed = 0
-                skipped = 0
-
-                desc = f"{group} {cam} B{band:02d}"
-                for fp in iter_with_progress(sorted(files), desc=desc):
+            # Flight 1
+            if counts_f1 is not None:
+                for fp in iter_with_progress(sorted(files_f1[key]), desc=f"F1   {cam} B{band:02d}"):
                     try:
                         if not looks_like_tiff(fp):
-                            skipped += 1
                             with bad_log.open("a") as f:
                                 f.write(f"NOT_TIFF_OR_EMPTY\t{fp}\t-\n")
                             continue
-
                         img = tiff.imread(str(fp))
-                        update_hist(counts, img, bins=bins, value_range=value_range, stride=stride)
-                        processed += 1
-
+                        update_hist(counts_f1, img, bins=bins, value_range=value_range, stride=stride)
                     except (TiffFileError, OSError, ValueError) as e:
-                        skipped += 1
                         with bad_log.open("a") as f:
                             f.write(f"READ_ERROR\t{fp}\t{repr(e)}\n")
                         continue
 
-                out_png = base_out / group / f"band_{band:02d}_{cam}.png"
-                save_hist_plot(
-                    out_png,
-                    counts,
-                    bins=bins,
-                    value_range=value_range,
-                    title=f"{site} | {group} | {cam} | Band {band:02d} | files={processed} (skipped={skipped})",
-                )
+            # Flight 2
+            if counts_f2 is not None:
+                for fp in iter_with_progress(sorted(files_f2[key]), desc=f"F2   {cam} B{band:02d}"):
+                    try:
+                        if not looks_like_tiff(fp):
+                            with bad_log.open("a") as f:
+                                f.write(f"NOT_TIFF_OR_EMPTY\t{fp}\t-\n")
+                            continue
+                        img = tiff.imread(str(fp))
+                        update_hist(counts_f2, img, bins=bins, value_range=value_range, stride=stride)
+                    except (TiffFileError, OSError, ValueError) as e:
+                        with bad_log.open("a") as f:
+                            f.write(f"READ_ERROR\t{fp}\t{repr(e)}\n")
+                        continue
+
+            out_png = out_dir / f"band_{band:02d}_{cam}.png"
+            title = f"{site} | Band {band:02d} | {cam}"
+            save_three_hist_plot(
+                out_png,
+                counts_f1=counts_f1,
+                counts_f2=counts_f2,
+                counts_join=counts_join,
+                bins=bins,
+                value_range=value_range,
+                title=title,
+            )
 
     print("Done.")
     print(f"Summary: {summary_txt}")
